@@ -297,7 +297,7 @@ export async function newsletterGroupEndpoint(params) {
  * if form.group is null, unsubscribes from all groups.
  */
 export async function unsubscribeNewsletter(
-    params: { group: number | 'public' | 'authorized' | 'admin' | null; }
+    params: { group: number | 'public' | 'authorized' | 'admin' | string; }
 ): Promise<string> {
     await this.__connection;
 
