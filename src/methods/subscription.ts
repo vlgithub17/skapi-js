@@ -304,7 +304,16 @@ export async function unsubscribeNewsletter(
     params = validator.Params(
         params,
         {
-            group: ['number', 'public', 'authorized', 'admin']
+            group: (v: number | string) => {
+                if (typeof v === 'string') {
+                    // Accept any string without validation
+                    return v;
+                }
+                if (typeof v === 'number' || ['public', 'authorized', 'admin'].includes(v)) {
+                    return v;
+                }
+                throw new SkapiError('"group" should be a number or a string.', { code: 'INVALID_PARAMETER' });
+            }
         },
         ['group']
     );
