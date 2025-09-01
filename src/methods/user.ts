@@ -546,7 +546,7 @@ export async function logout(params?: Form<{ global:boolean; }>): Promise<'SUCCE
     return 'SUCCESS: The user has been logged out.';
 }
 
-export async function resendSignupConfirmation(): Promise<'SUCCESS: Signup confirmation E-Mail has been sent.'> {
+export async function resendSignupConfirmation(): Promise<'SUCCESS: Signup confirmation e-mail has been sent.'> {
     if (!this.__request_signup_confirmation) {
         throw new SkapiError('Least one login attempt is required.', { code: 'INVALID_REQUEST' });
     }
@@ -555,7 +555,7 @@ export async function resendSignupConfirmation(): Promise<'SUCCESS: Signup confi
         username: this.__request_signup_confirmation,
     });
 
-    return resend; // 'SUCCESS: Signup confirmation E-Mail has been sent.'
+    return resend; // 'SUCCESS: Signup confirmation e-mail has been sent.'
 }
 
 export async function recoverAccount(
@@ -1056,7 +1056,7 @@ export async function updateProfile(form: Form<UserAttributes>): Promise<UserPro
     }
 
     let collision = [
-        ['email_public', 'email_verified', "User's E-Mail should be verified to set"],
+        ['email_public', 'email_verified', "User's e-mail should be verified to set"],
         ['phone_number_public', 'phone_number_verified', "User's phone number should be verified to set"]
     ];
 

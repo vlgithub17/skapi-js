@@ -19,6 +19,12 @@ export async function getFeed(params?: { access_group?: number; }, fetchOptions?
         params || {},
         {
             access_group: v => {
+                if(v === 'authorized') {
+                    v = 1;
+                }
+                if(v === 'public') {
+                    v = 0;
+                }
                 if (typeof v !== 'number') {
                     throw new SkapiError('"access_group" should be type number.', { code: 'INVALID_PARAMETER' });
                 }
@@ -80,11 +86,17 @@ export async function getSubscriptions(
 
     response.list = response.list.map(((s: Record<string, any>) => {
         let subscription: Record<string, any> = {};
-        let subSplit = s.sub.split('#');
-        subscription.subscriber = subSplit[2];
-        subscription.subscription = subSplit[0];
-        subscription.timestamp = s.stmp;
-        subscription.blocked = s.grp.substring(0, 1) === 'N';
+        if(s.sub) {
+            let subSplit = s.sub.split('#');
+            subscription.subscriber = subSplit[2];
+            subscription.subscription = subSplit[0];
+        }
+        else {
+            subscription.subscriber = s.subscriber;
+            subscription.subscription = s.subscription;
+        }
+        subscription.timestamp = s?.timestamp || s.stmp;
+        subscription.blocked = s?.blocked || s.grp.substring(0, 1) === 'N';
         Object.assign(subscription, s.opt);
         return subscription;
     }));
@@ -92,7 +104,15 @@ export async function getSubscriptions(
     return response;
 }
 
-export async function subscribe(params: { user_id: string; get_feed?: boolean; get_notified?: boolean; get_email?: boolean; }): Promise<'SUCCESS: The user has subscribed.'> {
+export async function subscribe(params: { user_id: string; get_feed?: boolean; get_notified?: boolean; get_email?: boolean; }): Promise<{
+    subscriber: string; // Subscriber ID
+    subscription: string; // Subscription ID
+    timestamp: number; // Subscribed UNIX timestamp
+    blocked: boolean; // True when subscriber is blocked by subscription
+    get_feed: boolean; // True when subscriber gets feed
+    get_notified: boolean; // True when subscriber gets notified
+    get_email: boolean; // True when subscriber gets email
+}> {
     await this.__connection;
     params = validator.Params(params, {
         user_id: cannotBeSelfId.bind(this),
@@ -106,7 +126,7 @@ export async function subscribe(params: { user_id: string; get_feed?: boolean; g
         }
     }, ['user_id']);
 
-    return await request.bind(this)('subscription', {
+    let s = await request.bind(this)('subscription', {
         subscribe: params.user_id,
         option: {
             get_feed: params.get_feed,
@@ -114,6 +134,21 @@ export async function subscribe(params: { user_id: string; get_feed?: boolean; g
             get_email: params.get_email || false
         }
     }, { auth: true });
+
+    let subscription:any = {};
+    if(s.sub) {
+        let subSplit = s.sub.split('#');
+        subscription.subscriber = subSplit[2];
+        subscription.subscription = subSplit[0];
+    }
+    else {
+        subscription.subscriber = s.subscriber;
+        subscription.subscription = s.subscription;
+    }
+    subscription.timestamp = s?.timestamp || s.stmp;
+    subscription.blocked = s?.blocked || s.grp.substring(0, 1) === 'N';
+    Object.assign(subscription, s.opt);
+    return subscription;
 }
 
 export async function adminNewsletterRequest(params) {

@@ -20,7 +20,20 @@ import { authentication } from './user';
 import { accessGroup, cannotBeEmptyString, getStruct, indexValue, recordIdOrUniqueId } from './param_restrictions';
 
 
-export async function normalizeRecord(record: Record<string, any>): Promise<RecordData> {
+export async function normalizeRecord(record: Record<string, any>, _called_from?): Promise<RecordData> {
+    if (record?.rec) {
+        if (_called_from !== 'called from postRecord') {
+            let recPost = sessionStorage.getItem(`${this.service}:post:${record.rec}`);
+            if (recPost) {
+                try {
+                    record = JSON.parse(recPost);
+                }
+                catch (err) { }
+                sessionStorage.removeItem(`${this.service}:post:${record.rec}`);
+            }
+        }
+    }
+
     this.log('normalizeRecord', record);
     const output: Record<string, any> = {
         user_id: '',
@@ -30,7 +43,14 @@ export async function normalizeRecord(record: Record<string, any>): Promise<Reco
         readonly: false,
         table: {
             name: '',
-            access_group: 0
+            access_group: 0,
+            subscription: {
+                is_subscription_record: false,
+                upload_to_feed: false,
+                notify_subscribers: false,
+                feed_referencing_records: false,
+                notify_referencing_records: false
+            }
         },
         referenced_count: 0,
         source: {
@@ -81,8 +101,6 @@ export async function normalizeRecord(record: Record<string, any>): Promise<Reco
                 output.table.name = rSplit[0];
                 output.table.access_group = access_group_set(rSplit[2]);
                 if (rSplit?.[3]) {
-                    if (!output.table?.subscription)
-                        output.table.subscription = {};
                     output.table.subscription.is_subscription_record = true;
                 }
             }
@@ -97,8 +115,6 @@ export async function normalizeRecord(record: Record<string, any>): Promise<Reco
                 output.table.name = rSplit[1];
                 output.table.access_group = access_group_set(rSplit[3]);
                 if (rSplit?.[4]) {
-                    if (!output.table?.subscription)
-                        output.table.subscription = {};
                     output.table.subscription.is_subscription_record = true;
                 }
             }
@@ -132,7 +148,7 @@ export async function normalizeRecord(record: Record<string, any>): Promise<Reco
             output.source.referencing_limit = r;
         },
         "alw_gnt": (r: boolean) => {
-            output.source.allow_granted_to_grant_others = r;
+            output.source.allow_granted_to_grant_others = r; // depricated. // this is here just for backward compatibility. // now it will have value directly in prv_acs.allow_granted_to_grant_others
         },
         'rfd': (r: number) => {
             // output.reference.referenced_count = r; // depricated
@@ -185,11 +201,8 @@ export async function normalizeRecord(record: Record<string, any>): Promise<Reco
         },
         'prv_acs': (r: { [key: string]: string }) => {
             for (let k in r) {
-                let subscription_config = ['notify_subscribers', 'exclude_from_feed', 'feed_referencing_records', 'notify_referencing_records'];
+                let subscription_config = ['notify_subscribers', 'upload_to_feed', 'feed_referencing_records', 'notify_referencing_records'];
                 if (subscription_config.includes(k)) {
-                    if (!output.table.subscription) {
-                        output.table.subscription = {};
-                    }
                     output.table.subscription[k] = r[k];
                 }
                 else {
@@ -212,15 +225,6 @@ export async function normalizeRecord(record: Record<string, any>): Promise<Reco
     if (record.record_id) {
         // bypass already normalized records
         return record as RecordData;
-    }
-
-    if (this.__iPosted[record.rec]) {
-        if (this.__iPosted[record.rec].record_id) {
-            return this.__iPosted[record.rec];
-        }
-        else {
-            delete this.__iPosted[record.rec];
-        }
     }
 
     for (let k in keys) {
@@ -360,12 +364,12 @@ export async function getFile(
     }
 
     let filename = url.split('/').slice(-1)[0];
-    
+
     // if ((config?.dataType === 'blob' || config?.dataType === 'base64') && needAuth) {
     //     // when downloading blob, use signed url
     //     config.expires = 60;
     // }
-    
+
     let expires = config.expires;
     if (expires) {
         if (!isValidEndpoint) {
@@ -604,10 +608,10 @@ export async function postRecord(
         config.table = {
             name: config.table
         };
+    }
 
-        if (!config.record_id) {
-            config.table.access_group = 0;
-        }
+    if (!config.record_id && !config.table.hasOwnProperty('access_group')) {
+        config.table.access_group = 0;
     }
 
     let reference_limit_check = (v: number) => {
@@ -660,10 +664,8 @@ export async function postRecord(
                     }
                     return null;
                 },
-
-                exclude_from_feed: 'boolean',
+                upload_to_feed: 'boolean',
                 notify_subscribers: 'boolean',
-
                 feed_referencing_records: 'boolean',
                 notify_referencing_records: 'boolean',
             },
@@ -800,7 +802,7 @@ export async function postRecord(
     let to_bin = null;
     let extractedForm = extractFormData(form);
 
-    if(files) {
+    if (files) {
         to_bin = files;
     }
     else if (extractedForm.files.length) {
@@ -845,11 +847,14 @@ export async function postRecord(
         this.__private_access_key[is_reference_post] = rec.reference_private_key;
     }
 
-    let record = await normalizeRecord.bind(this)(rec);
-    this.__iPosted[record.record_id] = record;
+    sessionStorage.setItem(`${this.service}:post:${rec.rec}`, JSON.stringify(rec));
+
+    let record = await normalizeRecord.bind(this)(rec, 'called from postRecord');
     if (record.unique_id) {
         this.__my_unique_ids[record.unique_id] = record.record_id;
+        sessionStorage.setItem(`${this.service}:uniqueids`, JSON.stringify(this.__my_unique_ids));
     }
+
     return record;
 }
 

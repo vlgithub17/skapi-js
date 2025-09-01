@@ -135,12 +135,11 @@ import {
 } from '../methods/vivian';
 export default class Skapi {
     // current version
-    private __version = '1.0.244';
+    private __version = '1.0.262';
     service: string;
     owner: string;
     session: Record<string, any> | null = null;
     connection: Connection | null = null;
-    private __iPosted: { [rec_id: string]: RecordData } = {};
     private __my_unique_ids: { [rec_id: string]: string } = {};
     private userPool: CognitoUserPool | null = null;
     private __socket: Promise<WebSocket> | null = null;
@@ -310,8 +309,13 @@ export default class Skapi {
         }
 
         if (!service || !owner) {
-            alert("Service ID or Owner ID is invalid.");
-            throw new SkapiError('"service" and "owner" is required', { code: 'INVALID_PARAMETER' });
+            alert('Service ID and Owner ID are required.');
+            throw new SkapiError('"service" and "owner" are required.', { code: 'INVALID_PARAMETER' });
+        }
+
+        if (service.toLowerCase() === 'service_id' || owner.toLowerCase() === 'owner_id') {
+            alert('Replace "service_id" and "owner_id" with your actual Service ID and Owner ID.');
+            throw new SkapiError('"service" and "owner" are required.', { code: 'INVALID_PARAMETER' });
         }
 
         if (owner !== this.host) {
@@ -424,6 +428,15 @@ export default class Skapi {
             catch (err) {
             }
         })()
+        
+        let uniqueids = sessionStorage.getItem(`${this.service}:uniqueids`);
+        if (uniqueids) {
+            try {
+                this.__my_unique_ids = JSON.parse(uniqueids);
+            } catch (err) {
+                this.__my_unique_ids = {};
+            }
+        }
 
         // connects to server
         this.__connection = (async (): Promise<Connection> => {
@@ -529,7 +542,7 @@ export default class Skapi {
         await this.__connection;
 
         let skapi = `%c\r\n          $$\\                          $$\\ \r\n          $$ |                         \\__|\r\n $$$$$$$\\ $$ |  $$\\ $$$$$$\\   $$$$$$\\  $$\\ \r\n$$  _____|$$ | $$  |\\____$$\\ $$  __$$\\ $$ |\r\n\\$$$$$$\\  $$$$$$  \/ $$$$$$$ |$$ \/  $$ |$$ |\r\n \\____$$\\ $$  _$$< $$  __$$ |$$ |  $$ |$$ |\r\n$$$$$$$  |$$ | \\$$\\\\$$$$$$$ |$$$$$$$  |$$ |\r\n\\_______\/ \\__|  \\__|\\_______|$$  ____\/ \\__|\r\n                             $$ |          \r\n                             $$ |          \r\n                             \\__|          \r\n`;
-        console.log(`Built with:\n${skapi}Version: ${this.__version}\n\nDocumentation: https://docs.skapi.com`, `font-family: monospace; color:blue;`);
+        console.log(`Built with:\n${skapi}Version: ${this.__version}\n\nFull Documentation: https://docs.skapi.com/skapi.md`, `font-family: monospace; color:blue;`);
         if (this.connection.group === 1) {
             console.log(`%cSKAPI: THE SERVICE IS IN TRIAL MODE. ALL THE USERS AND DATA WILL BE INITIALIZED EVERY 30 DAYS.`, `font-family: monospace; color:red;`);
         }
@@ -855,7 +868,7 @@ export default class Skapi {
     @formHandler()
     deleteRecords(params: DelRecordQuery, fetchOptions?: FetchOptions): Promise<string | DatabaseResponse<RecordData>> { return deleteRecords.bind(this)(params, fetchOptions); }
     @formHandler()
-    resendSignupConfirmation(): Promise<'SUCCESS: Signup confirmation E-Mail has been sent.'> {
+    resendSignupConfirmation(): Promise<'SUCCESS: Signup confirmation e-mail has been sent.'> {
         return resendSignupConfirmation.bind(this)();
     }
     @formHandler()
@@ -1121,7 +1134,15 @@ export default class Skapi {
         return getSubscriptions.bind(this)(params, fetchOptions);
     }
     @formHandler()
-    subscribe(params: { user_id: string; get_feed?: boolean; get_notified?: boolean; get_email?: boolean; }): Promise<'SUCCESS: The user has subscribed.'> {
+    subscribe(params: { user_id: string; get_feed?: boolean; get_notified?: boolean; get_email?: boolean; }): Promise<{
+        subscriber: string; // Subscriber ID
+        subscription: string; // Subscription ID
+        timestamp: number; // Subscribed UNIX timestamp
+        blocked: boolean; // True when subscriber is blocked by subscription
+        get_feed: boolean; // True when subscriber gets feed
+        get_notified: boolean; // True when subscriber gets notified
+        get_email: boolean; // True when subscriber gets email
+    }> {
         return subscribe.bind(this)(params);
     }
     @formHandler()
