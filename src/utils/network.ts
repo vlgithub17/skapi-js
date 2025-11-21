@@ -5,7 +5,9 @@ import validator from './validator';
 import { MD5, generateRandom, extractFormData } from './utils';
 // import { authentication, getJwtToken } from '../methods/user';
 import { getJwtToken } from '../methods/user';
+import Queuecumber from "queuecumber";
 
+let queue = null;
 // Global counters for round-robin
 let privateCounter_admin = 0;
 let publicCounter_admin = 0;
@@ -62,7 +64,7 @@ async function getEndpoint(dest: string, auth: boolean) {
         case 'register-newsletter-group':
         case 'newsletter-group-endpoint':
         case 'invitation-list':
-        // case 'register-sender-email':
+            // case 'register-sender-email':
             const gateways_admin = auth
                 ? [admin.admin_private, admin.admin_private_2]
                 : [admin.admin_public, admin.admin_public_2];
@@ -134,6 +136,11 @@ async function getEndpoint(dest: string, auth: boolean) {
 
 const __pendingRequest: Record<string, Promise<any>> = {};
 
+export function terminatePendingRequests() {
+    if(queue) {
+        queue.terminate();
+    }
+}
 
 export async function request(
     url: string,
@@ -163,8 +170,8 @@ export async function request(
     method = method.toUpperCase();
 
     let __connection = null;
-    let service = this.service;
-    let owner = this.owner;
+    let service = data?.service || this.service;
+    let owner = data?.owner || this.owner;
     let token = null; // idToken
     let endpoint = await getEndpoint.bind(this)(url, !!auth);
 
@@ -177,42 +184,6 @@ export async function request(
 
     if (auth) {
         token = await getJwtToken.bind(this)();
-        // if (this.session) {
-        //     const currentTime = Math.floor(Date.now() / 1000);
-        //     const idToken = this.session.getIdToken();
-        //     const idTokenExp = idToken.getExpiration();
-        //     this.log('request:tokens', {
-        //         exp: this.session.idToken.payload.exp,
-        //         currentTime,
-        //         expiresIn: idTokenExp - currentTime,
-        //         token: this.session.accessToken.jwtToken,
-        //         refreshToken: this.session.refreshToken.token
-        //     });
-
-        //     if (idTokenExp < currentTime) {
-        //         this.log('request:requesting new token', null);
-        //         try {
-        //             await authentication.bind(this)().getSession({ refreshToken: true });
-        //             this.log('request:received new tokens', {
-        //                 exp: this.session.idToken.payload.exp,
-        //                 currentTime,
-        //                 expiresIn: idTokenExp - currentTime,
-        //                 token: this.session.accessToken.jwtToken,
-        //                 refreshToken: this.session.refreshToken.token
-        //             });
-        //         }
-        //         catch (err) {
-        //             this.log('request:new token error', err);
-        //             throw new SkapiError('User login is required.', { code: 'INVALID_REQUEST' });
-        //         }
-        //     }
-
-        //     token = this.session?.idToken?.jwtToken;
-        // }
-        // else {
-        //     this.log('request:no session', null);
-        //     throw new SkapiError('User login is required.', { code: 'INVALID_REQUEST' });
-        // }
     }
 
     let fetchOptions = {}; // record fetch options
@@ -312,10 +283,18 @@ export async function request(
         headers.Authorization = token;
     }
 
-    if (headers['Content-Type'] !== 'application/json') {
-        // add service and owner to headers if content type is not json
-        headers['Content-Meta'] = JSON.stringify({ service, owner });
-    }
+    let meta = {
+        public_identifier: this.__public_identifier,
+        service,
+        owner
+    };
+
+    headers['Content-Meta'] = JSON.stringify(meta);
+
+    // if (headers['Content-Type'] !== 'application/json') {
+    //     // add service and owner to headers if content type is not json
+    //     headers['Content-Meta'] = JSON.stringify(meta);
+    // }
 
     let opt: RequestInit & { responseType?: string | null, headers: Record<string, any>; } = { headers }; // request options
     if (options?.responseType) {
@@ -357,26 +336,45 @@ export async function request(
     }
 
     opt.method = method;
-    let promise = _fetch.bind(this)(endpoint, opt, progress);
-    __pendingRequest[requestKey as string] = promise.finally(() => {
-        delete __pendingRequest[requestKey as string];
+
+    if (queue === null) {
+        let config = {
+            batchSize: this.requestBatchSize,
+            breakWhenError: false,
+            onProgress: (progress) => {
+                for(let key in __pendingRequest) {
+                    delete __pendingRequest[key];
+                }
+                this.onBatchProcess.forEach((cb) => cb(progress));
+            }
+        };
+
+        queue = new Queuecumber(config);
+    }
+
+    return new Promise((res, rej) => {
+        queue.add([async () => {
+            let promise = _fetch.bind(this)(endpoint, opt, progress);
+            __pendingRequest[requestKey as string] = promise;
+
+            try {
+                let result = update_startKey_keys.bind(this)({
+                    hashedParam: requestKey,
+                    url,
+                    fetched: await promise
+                });
+
+                this.log('request:end', result);
+                res(result);
+                return result;
+            }
+            catch (err) {
+                this.log('request:err', err);
+                rej(err);
+                throw err;
+            }
+        }]);
     });
-
-    try {
-        let result = update_startKey_keys.bind(this)({
-            hashedParam: requestKey,
-            url,
-            fetched: await promise
-        });
-
-        this.log('request:end', result);
-
-        return result;
-    }
-    catch (err) {
-        this.log('request:err', err);
-        throw err;
-    }
 }
 
 function load_startKey_keys(option: {
@@ -420,7 +418,7 @@ function load_startKey_keys(option: {
                     }
                 }
             }
-            
+
             // delete start key lists
             delete this.__startKeyHistory[url][hashedParams];
         }
@@ -683,6 +681,7 @@ export async function uploadFiles(
     }
 
     let xhr;
+
     let fetchProgress = (
         url: string,
         body: FormData,
@@ -729,9 +728,6 @@ export async function uploadFiles(
         });
     };
 
-    let completed = [];
-    let failed = [];
-
     function toBase62(num: number) {
         const base62Chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
         if (num === 0) return base62Chars[0];
@@ -743,55 +739,69 @@ export async function uploadFiles(
         return result;
     }
 
-    let bin_endpoints = [];
-
-    for (let [key, f] of (fileList as any).entries()) {
-        if (!(f instanceof File)) {
-            continue;
-        }
-
-        let signedParams = Object.assign({
-            key: key + '/' + f.name,
-            sizeKey: toBase62(f.size),
-            contentType: f.type || null
-        }, getSignedParams);
-
-        let { fields = null, url, cdn } = await request.bind(this)('get-signed-url', signedParams, { auth: true });
-
-        bin_endpoints.push(cdn);
-
-        let form = new FormData();
-
-        for (let name in fields) {
-            form.append(name, fields[name]);
-        }
-
-        form.append('file', f);
-
-        try {
-            await fetchProgress(
-                url,
-                form,
-                typeof progress === 'function' ? (p: ProgressEvent) => progress(
-                    {
-                        status: 'upload',
-                        progress: p.loaded / p.total * 100,
-                        currentFile: f,
-                        completed,
-                        failed,
-                        loaded: p.loaded,
-                        total: p.total,
-                        abort: () => xhr.abort()
-                    }
-                ) : null
-            );
-            completed.push(f);
-        } catch (err) {
-            failed.push(f);
-        }
+    if (queue === null) {
+        queue = new Queuecumber({
+            batchSize: this.requestBatchSize,
+            breakWhenError: false
+        });
     }
 
-    return { completed, failed, bin_endpoints };
+    return new Promise((res, rej) => {
+        queue.add([async () => {
+            let completed = [];
+            let failed = [];
+            let bin_endpoints = [];
+
+            for (let [key, f] of (fileList as any).entries()) {
+                if (!(f instanceof File)) {
+                    continue;
+                }
+
+                let signedParams = Object.assign({
+                    key: key + '/' + f.name,
+                    sizeKey: toBase62(f.size),
+                    contentType: f.type || null
+                }, getSignedParams);
+
+                let { fields = null, url, cdn } = await request.bind(this)('get-signed-url', signedParams, { auth: !!this.__user });
+
+                bin_endpoints.push(cdn);
+
+                let form = new FormData();
+
+                for (let name in fields) {
+                    form.append(name, fields[name]);
+                }
+
+                form.append('file', f);
+
+                try {
+                    await fetchProgress(
+                        url,
+                        form,
+                        typeof progress === 'function' ? (p: ProgressEvent) => progress(
+                            {
+                                status: 'upload',
+                                progress: p.loaded / p.total * 100,
+                                currentFile: f,
+                                completed,
+                                failed,
+                                loaded: p.loaded,
+                                total: p.total,
+                                abort: () => xhr.abort()
+                            }
+                        ) : null
+                    );
+                    completed.push(f);
+                } catch (err) {
+                    failed.push(f);
+                }
+            }
+
+            res({ completed, failed, bin_endpoints });
+            return { completed, failed, bin_endpoints };
+        }]);
+    });
 }
 
 const pendPromise: Record<string, Promise<any> | null> = {};

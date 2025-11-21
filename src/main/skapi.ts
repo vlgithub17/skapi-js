@@ -62,7 +62,8 @@ import {
     request,
     getFormResponse,
     formHandler,
-    uploadFiles
+    uploadFiles,
+    terminatePendingRequests
 } from '../utils/network';
 import {
     subscribe,
@@ -103,8 +104,7 @@ import {
     registerTicket,
     unregisterTicket,
     _out,
-    openIdLogin,
-    // registerSenderEmail
+    openIdLogin
 } from '../methods/user';
 import {
     extractFormData,
@@ -133,9 +133,10 @@ import {
 import {
     spellcast, dopamine, getspell
 } from '../methods/vivian';
+
 export default class Skapi {
     // current version
-    private __version = '1.0.262';
+    private __version = "1.1.10";
     service: string;
     owner: string;
     session: Record<string, any> | null = null;
@@ -149,6 +150,7 @@ export default class Skapi {
     private hostDomain = 'skapi.com';
     private target_cdn = 'd3e9syvbtso631';
     private customApiDomain = 'skapi.dev';
+    private requestBatchSize = 30;
 
     // privates
     private __disabledAccount: string | null = null;
@@ -191,20 +193,38 @@ export default class Skapi {
         // setting user is bypassed
     }
 
+    private _userProfileListeners: Function[] = [];
     private _onLoginListeners: Function[] = [];
 
     get onLogin(): Function[] {
         return this._onLoginListeners;
     }
 
-    set onLogin(listener: (user: UserProfile) => void) {
-        // setting onLogin is bypassed
+    set onLogin(listener: (user: UserProfile | null) => void) {
         if (typeof listener === 'function') {
             this._onLoginListeners.push(listener);
         }
     }
 
-    private _runOnLoginListeners(user: UserProfile) {
+    get onUserUpdate(): Function[] {
+        return this._userProfileListeners;
+    }
+
+    set onUserUpdate(listener: (user: UserProfile | null) => void) {
+        if (typeof listener === 'function') {
+            this._userProfileListeners.push(listener);
+        }
+    }
+
+    private _runOnUserUpdateListeners(user: UserProfile | null) {
+        for (let listener of this._userProfileListeners) {
+            if (typeof listener === 'function') {
+                listener(user);
+            }
+        }
+    }
+
+    private _runOnLoginListeners(user: UserProfile | null) {
         for (let listener of this._onLoginListeners) {
             if (typeof listener === 'function') {
                 listener(user);
@@ -214,6 +234,30 @@ export default class Skapi {
 
     private admin_endpoint: Promise<Record<string, any>>;
     private record_endpoint: Promise<Record<string, any>>;
+
+    private _onBatchProcessListeners: ((process: {
+        batchToProcess: number;
+        itemsToProcess: number;
+        completed: any[];
+    }) => void)[] = [];
+
+    get onBatchProcess(): ((process: {
+        batchToProcess: number;
+        itemsToProcess: number;
+        completed: any[];
+    }) => void)[] {
+        return this._onBatchProcessListeners;
+    }
+
+    set onBatchProcess(listener: (process: {
+        batchToProcess: number;
+        itemsToProcess: number;
+        completed: any[];
+    }) => void) {
+        if (typeof listener === 'function') {
+            this._onBatchProcessListeners.push(listener);
+        }
+    }
 
     validate = {
         userId(val: string) {
@@ -267,6 +311,7 @@ export default class Skapi {
         toBase62,
         fromBase62,
         extractFormData,
+        terminatePendingRequests: terminatePendingRequests.bind(this),
         request: (
             url: string,
             data?: Form<any>,
@@ -285,12 +330,20 @@ export default class Skapi {
     private __authConnection: Promise<void>;
     private __network_logs = false;
     private __endpoint_version = 'v1';
+    private __public_identifier = '';
 
     constructor(service: string, owner: string, options?: {
         autoLogin: boolean;
+        requestBatchSize?: number; // default 30. number of requests to be handled in a batch
         eventListener?: {
-            onLogin: (user: UserProfile) => void;
-        }
+            onLogin?: (user: UserProfile | null) => void;
+            onUserUpdate?: (user: UserProfile | null) => void;
+            onBatchProcess?: (process: {
+                batchToProcess: number;
+                itemsToProcess: number;
+                completed: any[];
+            }) => void;
+        },
     }, __etc?: any) {
         if (!sessionStorage) {
             throw new SkapiError('Web browser API is not available.', { code: 'NOT_SUPPORTED' });
@@ -336,10 +389,26 @@ export default class Skapi {
             if (typeof options.autoLogin === 'boolean') {
                 autoLogin = options.autoLogin;
             }
+            if (typeof options.requestBatchSize === 'number') {
+                if (options.requestBatchSize < 1) {
+                    throw new SkapiError('"requestBatchSize" must be greater than 0.', { code: 'INVALID_PARAMETER' });
+                }
+                this.requestBatchSize = options.requestBatchSize;
+            }
         }
 
-        if (options?.eventListener?.onLogin && typeof options.eventListener.onLogin === 'function') {
-            this.onLogin = options.eventListener.onLogin;
+        if (options?.eventListener && typeof options.eventListener === 'object') {
+            if (options.eventListener?.onLogin && typeof options.eventListener.onLogin === 'function') {
+                this.onLogin = options.eventListener.onLogin;
+            }
+
+            if (options.eventListener?.onUserUpdate && typeof options.eventListener.onUserUpdate === 'function') {
+                this.onUserUpdate = options.eventListener.onUserUpdate;
+            }
+
+            if (options.eventListener?.onBatchProcess && typeof options.eventListener.onBatchProcess === 'function') {
+                this.onBatchProcess = options.eventListener.onBatchProcess;
+            }
         }
 
         // get endpoints
@@ -401,6 +470,10 @@ export default class Skapi {
             for (let k in restore) {
                 this[k] = restore[k];
             }
+
+            if (!restore.__public_identifier) {
+                this.__public_identifier = `${this.service}:${this.owner}:${generateRandom(16)}`;
+            }
         }
 
         this.__authConnection = (async (): Promise<void> => {
@@ -411,24 +484,24 @@ export default class Skapi {
             });
 
             try {
-                let fireWhenAutoLogin = await authentication.bind(this)().getSession({
-                    _holdLogin: true
+                await authentication.bind(this)().getSession({
+                    skipUserUpdateEventTrigger: true
                 });
-
-                if (!restore?.connection && !autoLogin) {
-                    _out.bind(this)();
-                }
-                else {
-                    let logFire = (fireWhenAutoLogin as Function)();
-                    if (logFire instanceof Promise) {
-                        await logFire;
+                if(this.user) {
+                    if(!restore?.connection && !autoLogin) {
+                        _out.bind(this)();
+                    }
+                    else {
+                        // only run login listeners if user is logged in (auto login successful)
+                        this._runOnLoginListeners(this.user);
+                        this._runOnUserUpdateListeners(this.user);
                     }
                 }
             }
             catch (err) {
             }
         })()
-        
+
         let uniqueids = sessionStorage.getItem(`${this.service}:uniqueids`);
         if (uniqueids) {
             try {
@@ -461,6 +534,7 @@ export default class Skapi {
                         '__disabledAccount', // disabled account : null
                         '__cached_requests', // cached records : {}
                         '__request_signup_confirmation', // for resend signup confirmation : null
+                        '__public_identifier', // public identifier : ''
                         'connection', // service info : null
                     ];
 
@@ -601,7 +675,7 @@ export default class Skapi {
         unique_id?: string;
         /** String query condition for tag name. */
         condition?: Condition;
-    }>, fetchOptions?:FetchOptions): Promise<DatabaseResponse<{
+    }>, fetchOptions?: FetchOptions): Promise<DatabaseResponse<{
         unique_id: string; // Unique ID
         record_id: string; // Record ID
     }>> {
@@ -623,13 +697,6 @@ export default class Skapi {
         return cancelInvitation.bind(this)(params);
     }
 
-    // @formHandler()
-    // registerSenderEmail(params: Form<{
-    //     email_alias: string;
-    // }>): Promise<"SUCCESS: Sender e-mail has been registered." | "ERROR: Email contains special characters." | "ERROR: Email is required."> {
-    //     return registerSenderEmail.bind(this)(params);
-    // }
-
     @formHandler()
     getInvitations(params: Form<{
         email?: string;
@@ -638,7 +705,7 @@ export default class Skapi {
     }
 
     @formHandler()
-    openIdLogin(params: { token: string; id: string; }): Promise<{ userProfile: UserProfile; openid: { [attribute: string]: string } }> {
+    openIdLogin(params: { token: string; id: string; merge?: boolean | string[]; }): Promise<{ userProfile: UserProfile; openid: { [attribute: string]: string } }> {
         return openIdLogin.bind(this)(params);
     }
     @formHandler()
@@ -661,7 +728,14 @@ export default class Skapi {
     }
 
     @formHandler()
-    consumeTicket(params: { ticket_id: string;[key: string]: any; }): Promise<any> {
+    consumeTicket(params: {
+        ticket_id: string;
+        method: string; // GET | POST
+        auth?: boolean;
+        data?: {
+            [key: string]: any;
+        }
+    }): Promise<any> {
         return consumeTicket.bind(this)(params);
     }
 
@@ -716,6 +790,10 @@ export default class Skapi {
         options?: {
             confirmation_url?: string;
             email_subscription?: boolean;
+            template?: {
+                url: string;
+                subject: string;
+            }
         }
     ): Promise<'SUCCESS: Invitation has been sent.'> {
         return inviteUser.bind(this)(form, options);
@@ -757,7 +835,7 @@ export default class Skapi {
         return newsletterGroupEndpoint.bind(this)(params);
     }
     @formHandler()
-    postRealtime(message: any, recipient: string, notification?: { config?: { always:boolean; }; title: string; body: string; }): Promise<{ type: 'success', message: 'Message sent.' }> {
+    postRealtime(message: any, recipient: string, notification?: { config?: { always: boolean; }; title: string; body: string; }): Promise<{ type: 'success', message: 'Message sent.' }> {
         return postRealtime.bind(this)(message, recipient, notification);
     }
 
@@ -1002,8 +1080,8 @@ export default class Skapi {
     }
     @formHandler()
     listPrivateRecordAccess(params: {
-        record_id: string;
-        user_id: string | string[];
+        record_id?: string;
+        user_id?: string | string[];
     }): Promise<DatabaseResponse<{ record_id: string; user_id: string; }>> { return listPrivateRecordAccess.bind(this)(params); }
     @formHandler()
     requestPrivateRecordAccessKey(params: { record_id: string; reference_id?: string; }): Promise<string> {

@@ -14,22 +14,35 @@ import {
     PublicUser
 } from '../Types';
 import validator from '../utils/validator';
-import { request } from '../utils/network';
+import { request, terminatePendingRequests } from '../utils/network';
 import { MD5, extractFormData, fromBase62, parseUserAttributes } from '../utils/utils';
 
 let cognitoUser: CognitoUser | null = null;
 
-function map_ticket_obj(t) {
+function map_ticket_obj(t): {
+    ticket_id?: string;
+    consume_id?: string;
+    user_id?: string;
+    is_test?: boolean;
+    timestamp?: number;
+    condition?: any;
+    action?: any;
+    count?: number;
+    time_to_live?: number;
+    description?: string;
+    limit_per_user?: number;
+} {
     let mapper = {
         "tkid": 'ticket_id',
         "cond": 'condition',
+        "stmp": 'timestamp',
         "actn": 'action',
         "cnt": 'count',
         "ttl": 'time_to_live',
-        "stmp": 'timestamp',
         'plch': 'placeholder',
         'hash': 'hash',
         'desc': 'description',
+        'pmc': 'limit_per_user'
     }
     let new_obj = {};
     for (let k in t) {
@@ -43,8 +56,20 @@ function map_ticket_obj(t) {
             new_obj['consume_id'] = tkid[2];
             new_obj['user_id'] = tkid[3];
 
+            // last 4 characters are random chars
+            let rand = tkid[2].slice(-4);
+            new_obj["is_test"] = rand === ":CHK";
+
             if (!t.stmp) {
-                new_obj['timestamp'] = fromBase62(tkid[2].slice(0, -4));
+                let timestampStr = tkid[2].slice(0, -4);
+
+                // check if timestampStr is a number string
+                if (/^[0-9]+$/.test(timestampStr)) {
+                    new_obj['timestamp'] = parseInt(timestampStr, 10);
+                }
+                else {
+                    new_obj['timestamp'] = fromBase62(tkid[2].slice(0, -4));
+                }
             }
         }
         else if (mapper[k]) {
@@ -57,14 +82,24 @@ function map_ticket_obj(t) {
     return new_obj;
 }
 
-export async function consumeTicket(params: { ticket_id: string; } & { [key: string]: any }): Promise<any> {
+export async function consumeTicket(params: {
+    ticket_id: string;
+    method: string; // GET | POST
+    auth?: boolean;
+    data?: {
+        [key: string]: any;
+    }
+}): Promise<any> {
     if (!params.ticket_id) {
         throw new SkapiError('Ticket ID is required.', { code: 'INVALID_PARAMETER' });
+    }
+    if (!params.method) {
+        throw new SkapiError('Method is required. Should be either "GET" or "POST"', { code: 'INVALID_PARAMETER' });
     }
     let ticket_id = params.ticket_id;
 
     await this.__connection;
-    let resp = await request.bind(this)(`https://${this.service.slice(0, 4)}.${this.customApiDomain}/auth/consume/${this.service}/${this.owner}/${ticket_id}`, params, { auth: true });
+    let resp = await request.bind(this)(`https://${this.service.slice(0, 4)}.${this.customApiDomain}/auth/consume/${this.service}/${this.owner}/${ticket_id}`, params?.data || {}, { method: params.method, auth: !!params?.auth });
     return map_ticket_obj(resp);
 }
 
@@ -93,6 +128,7 @@ export async function registerTicket(
         count?: number;
         time_to_live?: number;
         placeholder?: { [key: string]: string };
+        limit_per_user?: number;
         condition?: {
             return200?: boolean; // When true, returns 200 when regardless condition mismatch
             method?: 'GET' | 'POST'; // Defaults to 'GET' method when not given
@@ -209,13 +245,7 @@ export async function getJwtToken() {
     }
 }
 
-
-let isRefreshing = null;
 function refreshSession(session, cognitoUser) {
-    if (isRefreshing instanceof Promise) {
-        return isRefreshing;
-    }
-
     return new Promise((res, rej) => {
         cognitoUser.refreshSession(session.getRefreshToken(), (refreshErr, refreshedSession) => {
             this.log('getSession:refreshSessionCallback', { refreshErr, refreshedSession });
@@ -249,12 +279,15 @@ export function authentication() {
         return user;
     };
 
-    const getSession = (option?: { skipEventTrigger?: boolean; refreshToken?: boolean; _holdLogin?: boolean }): Promise<CognitoUserSession | Function> => {
-        // fetch session, updates user attributes
-        this.log('getSession:option', option);
-        let { refreshToken = false, skipEventTrigger = false } = option || {};
+    const getSession = async (option?: { skipUserUpdateEventTrigger?: boolean; refreshToken?: boolean; }): Promise<CognitoUserSession> =>
+        new Promise((res, rej) => {
+            // fetch session, updates user attributes
+            this.log('getSession:option', option);
+            let { refreshToken = false, skipUserUpdateEventTrigger = false } = option || {};
+            if (refreshToken && skipUserUpdateEventTrigger) {
+                skipUserUpdateEventTrigger = false;
+            }
 
-        return new Promise((res, rej) => {
             cognitoUser = this.userPool.getCurrentUser();
 
             if (!cognitoUser) {
@@ -265,40 +298,26 @@ export function authentication() {
                 return;
             }
 
-            cognitoUser.getSession((err: any, session: CognitoUserSession) => {
-                this.log('getSession:getSessionCallback', { err, session });
+            let respond = (s: any) => {
+                let sessionAttribute = s.getIdToken().payload;
+                this.log('getSession:respond:sessionAttribute', sessionAttribute);
 
-                let respond = async (s: CognitoUserSession) => {
-                    let sessionAttribute = s.getIdToken().payload;
-                    this.log('getSession:respond:sessionAttribute', sessionAttribute);
-
-                    if (sessionAttribute['custom:service'] !== this.service) {
-                        this.log('getSession:respond', 'invalid service, signing out');
-                        _out.bind(this)();
-                        rej(new SkapiError('Invalid session.', { code: 'INVALID_REQUEST' }));
-                        return;
-                    }
-
-                    if (option?._holdLogin) {
-                        // hold login
-                        res(() => {
-                            this.session = s;
-                            getUserProfile();
-                            if (!skipEventTrigger) {
-                                this._runOnLoginListeners(this.user);
-                            }
-                            return this.session;
-                        });
-                        return;
-                    }
-                    this.session = s;
-                    getUserProfile();
-                    if (!skipEventTrigger) {
-                        this._runOnLoginListeners(this.user);
-                    }
-                    res(this.session);
+                if (sessionAttribute['custom:service'] !== this.service) {
+                    this.log('getSession:respond', 'invalid service, signing out');
+                    _out.bind(this)();
+                    throw new SkapiError('Invalid session.', { code: 'INVALID_REQUEST' });
                 }
 
+                this.session = s;
+                getUserProfile();
+                if (!skipUserUpdateEventTrigger) {
+                    this._runOnUserUpdateListeners(this.user);
+                }
+                return this.session;
+            }
+
+            cognitoUser.getSession((err: any, session: CognitoUserSession) => {
+                this.log('getSession:getSessionCallback', { err, session });
                 if (!session) {
                     _out.bind(this)();
                     rej(new SkapiError('Current session does not exist.', { code: 'INVALID_REQUEST' }));
@@ -306,13 +325,7 @@ export function authentication() {
                 }
 
                 if (err) {
-                    refreshSession.bind(this)(session, cognitoUser).then(refreshedSession => respond(refreshedSession)).catch(err => {
-                        _out.bind(this)();
-                        rej(err);
-                    }).finally(() => {
-                        isRefreshing = null;
-                    });
-
+                    refreshSession.bind(this)(session, cognitoUser).then(r => res(respond(r))).catch(rej);
                     return;
                 }
 
@@ -323,21 +336,22 @@ export function authentication() {
                 this.log('getSession:currentTime', currentTime);
                 this.log('getSession:idTokenExp', idTokenExp);
                 this.log('getSession:isExpired', isExpired);
+                
                 // try refresh when invalid token
+                // when on updateProfile, it will always refreshToken
                 if (isExpired || refreshToken || !session.isValid()) {
-                    refreshSession.bind(this)(session, cognitoUser).then(refreshedSession => respond(refreshedSession)).catch(err => {
-                        _out.bind(this)();
-                        rej(err);
-                    }).finally(() => {
-                        isRefreshing = null;
-                    });
+                    refreshSession.bind(this)(session, cognitoUser).then(r => res(respond(r))).catch(rej);
                 }
                 else {
-                    respond(session).catch(err => rej(err));
+                    try {
+                        res(respond(session));
+                    }
+                    catch(err) {
+                        rej(err);
+                    }
                 }
             });
         });
-    };
 
     const createCognitoUser = (un: string, raw?: boolean) => {
         let username = raw ? un : un.includes(this.service + '-') ? un : this.service + '-' + MD5.hash(un);
@@ -351,7 +365,7 @@ export function authentication() {
         };
     };
 
-    const authenticateUser = (email: string, password: string, raw: boolean = false): Promise<UserProfile> => {
+    const authenticateUser = (email: string, password: string, raw: boolean = false, is_openid: boolean = false): Promise<UserProfile> => {
         return new Promise((res, rej) => {
             this.__request_signup_confirmation = null;
             this.__disabledAccount = null;
@@ -367,7 +381,7 @@ export function authentication() {
                 newPasswordRequired: (userAttributes, requiredAttributes) => {
                     this.__disabledAccount = null;
                     this.__request_signup_confirmation = username;
-                    if (userAttributes['custom:signup_ticket'] === 'PASS' || userAttributes['custom:signup_ticket'] === 'MEMBER') {
+                    if (userAttributes['custom:signup_ticket'] === 'PASS' || userAttributes['custom:signup_ticket'] === 'MEMBER' || userAttributes['custom:signup_ticket'] === 'OIDPASS') {
                         // auto confirm - (setting password from admin created account)
                         initUser.cognitoUser.completeNewPasswordChallenge(password, {}, {
                             onSuccess: _ => {
@@ -384,8 +398,10 @@ export function authentication() {
                         rej(new SkapiError("User's signup confirmation is required.", { code: 'SIGNUP_CONFIRMATION_NEEDED' }));
                     }
                 },
-                onSuccess: _ => getSession().then(_ => {
+                onSuccess: _ => getSession({ skipUserUpdateEventTrigger: true }).then(_ => {
                     this.__disabledAccount = null;
+                    this._runOnLoginListeners(this.user);
+                    this._runOnUserUpdateListeners(this.user);
                     res(this.user);
                 }),
                 onFailure: (err: any) => {
@@ -398,7 +414,12 @@ export function authentication() {
                         }
 
                         else {
-                            error = ['Incorrect username or password.', 'INCORRECT_USERNAME_OR_PASSWORD'];
+                            if (is_openid) {
+                                error = ['The account already exists.', 'ACCOUNT_EXISTS'];
+                            }
+                            else {
+                                error = ['Incorrect username or password.', 'INCORRECT_USERNAME_OR_PASSWORD'];
+                            }
                         }
                     }
                     else if (err.code === "UserNotFoundException") {
@@ -419,7 +440,7 @@ export function authentication() {
                     // "#INVALID_REQUEST: the account has been blacklisted"
                     // "#NOT_EXISTS: the account does not exist"
                     // "#CONFIRM_REQUIRED": The account signup needs to be confirmed"
-
+                    // "#ACCOUNT_EXISTS": The account already exists"
                     if (customErr.length > 1) {
                         customErr = customErr[customErr.length - 1].split(':');
                         errCode = customErr[0];
@@ -461,18 +482,36 @@ export function authentication() {
 export async function getProfile(options?: { refreshToken: boolean; }): Promise<UserProfile | null> {
     await this.__authConnection;
     try {
-        await authentication.bind(this)().getSession(Object.assign({ skipEventTrigger: true }, options));
+        await authentication.bind(this)().getSession(Object.assign({ skipUserUpdateEventTrigger: true }, options));
         return this.user;
     } catch (err) {
         return null;
     }
 }
 
-export async function openIdLogin(params: { token: string; id: string; }): Promise<{ userProfile: UserProfile; openid: { [attribute: string]: string } }> {
+export async function openIdLogin(params: { token: string; id: string; merge?: boolean | string[] }): Promise<{ userProfile: UserProfile; openid: { [attribute: string]: string } }> {
     await this.__connection;
+
     params = validator.Params(params, {
         token: 'string',
-        id: 'string'
+        id: 'string',
+        merge: v => {
+            if (v === undefined) return false;
+            if (typeof v === 'string') {
+                return [v]
+            }
+            if (Array.isArray(v)) {
+                for (let item of v) {
+                    if (typeof item !== 'string') {
+                        throw new SkapiError('"merge" array items should be type: <string>.', { code: 'INVALID_PARAMETER' });
+                    }
+                }
+            }
+            if (typeof v !== 'boolean' && !Array.isArray(v)) {
+                throw new SkapiError('"merge" should be type: <boolean | string[]>.', { code: 'INVALID_PARAMETER' });
+            }
+            return v;
+        }
     });
 
     let oplog = await request.bind(this)("openid-logger", params);
@@ -480,7 +519,7 @@ export async function openIdLogin(params: { token: string; id: string; }): Promi
     let username = this.service + '-' + logger[0];
     let password = logger[1];
 
-    return { userProfile: await authentication.bind(this)().authenticateUser(username, password, true), openid: oplog.openid };
+    return { userProfile: await authentication.bind(this)().authenticateUser(username, password, true, true), openid: oplog.openid };
 }
 
 export async function checkAdmin() {
@@ -498,8 +537,9 @@ export async function checkAdmin() {
 
 export async function _out(global: boolean = false) {
     let toReturn = null;
+    
     if (cognitoUser) {
-        if(global) {
+        if (global) {
             toReturn = new Promise((res, rej) => {
                 cognitoUser.globalSignOut({
                     onSuccess: (result: any) => {
@@ -525,7 +565,7 @@ export async function _out(global: boolean = false) {
         '__user': null
     };
 
-    if(toReturn) {
+    if (toReturn) {
         toReturn = await toReturn;
     }
 
@@ -533,11 +573,13 @@ export async function _out(global: boolean = false) {
         this[k] = to_be_erased[k];
     }
 
+    this._runOnUserUpdateListeners(null);
     this._runOnLoginListeners(null);
+
     return toReturn;
 }
 
-export async function logout(params?: Form<{ global:boolean; }>): Promise<'SUCCESS: The user has been logged out.'> {
+export async function logout(params?: Form<{ global: boolean; }>): Promise<'SUCCESS: The user has been logged out.'> {
     await this.__connection;
 
     let { data } = extractFormData(params);
@@ -610,8 +652,9 @@ export async function login(
         throw new SkapiError('Least one of "username" or "email" is required.', { code: 'INVALID_PARAMETER' });
     }
 
-    return await authentication.bind(this)().authenticateUser(params.username || params.email, params.password);
+    const resolved = await authentication.bind(this)().authenticateUser(params.username || params.email, params.password);
 
+    return resolved;
     // INVALID_REQUEST: the account has been blacklisted.
     // NOT_EXISTS: the account does not exist.
 }
@@ -1103,11 +1146,11 @@ export async function updateProfile(form: Form<UserAttributes>): Promise<UserPro
 
     if (params.user_id) {
         let user_id = params.user_id;
-        if(user_id === this.user.user_id) {
+        if (user_id === this.user.user_id) {
             delete params.user_id;
         }
         else {
-            return request.bind(this)('admin-edit-profile', {attributes: params}, { auth: true });
+            return request.bind(this)('admin-edit-profile', { attributes: params }, { auth: true });
         }
     }
 
@@ -1300,40 +1343,3 @@ export async function requestUsernameChange(params: {
 
     return await request.bind(this)('request-username-change', params, { auth: true });
 }
-
-// export async function registerSenderEmail(params: Form<{
-//     email_alias: string;
-// }>): Promise<"SUCCESS: Sender e-mail has been registered." | "ERROR: Email contains special characters." | "ERROR: Email is required."> {
-//     await this.__connection;
-
-//     if (!this.session) {
-//         throw new SkapiError('User login is required.', { code: 'INVALID_REQUEST' });
-//     }
-//     let emailAlias: string;
-
-//     let user_params = extractFormData(params)
-
-//     params = user_params.data;
-
-//     // if (params instanceof FormData) {
-//     //     emailAlias = params.get('email_alias') as string;
-//     // } else
-    
-//     if (params && 'email_alias' in params) {
-//         emailAlias = params.email_alias;
-//     } else {
-//         emailAlias = '';
-//     }
-
-//     if (!emailAlias) {
-//         throw new SkapiError('Email is required.', { code: 'INVALID_PARAMETER' });
-//     }
-
-//     const specialCharPattern = /[!#$%^&*(),?":{}|<>]/g;
-//     if (specialCharPattern.test(emailAlias)) {
-//         throw new SkapiError('Email contains special characters.', { code: 'INVALID_PARAMETER' });
-//     }
-
-//     let response = await request.bind(this)('register-sender-email', { email_alias: emailAlias});
-//     return response;
-// }

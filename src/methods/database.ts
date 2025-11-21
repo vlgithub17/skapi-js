@@ -19,7 +19,6 @@ import { checkAdmin } from './user';
 import { authentication } from './user';
 import { accessGroup, cannotBeEmptyString, getStruct, indexValue, recordIdOrUniqueId } from './param_restrictions';
 
-
 export async function normalizeRecord(record: Record<string, any>, _called_from?): Promise<RecordData> {
     if (record?.rec) {
         if (_called_from !== 'called from postRecord') {
@@ -34,7 +33,6 @@ export async function normalizeRecord(record: Record<string, any>, _called_from?
         }
     }
 
-    this.log('normalizeRecord', record);
     const output: Record<string, any> = {
         user_id: '',
         record_id: '',
@@ -62,6 +60,7 @@ export async function normalizeRecord(record: Record<string, any>, _called_from?
         ip: '',
         bin: {}
     };
+    let is_anonymous = false;
     function access_group_set(v) {
         let access_group = v == '**' ? 'private' : parseInt(v);
         access_group = access_group == 0 ? 'public' : access_group == 1 ? 'authorized' : access_group == 99 ? 'admin' : access_group;
@@ -81,6 +80,13 @@ export async function normalizeRecord(record: Record<string, any>, _called_from?
             else {
                 output.readonly = false;
             }
+            // check if the format of the ip is 0-0-0-0, if it is, convert it to 0.0.0.0
+
+            if (/^\d{1,3}-\d{1,3}-\d{1,3}-\d{1,3}$/.test(ip)) {
+                ip = ip.split('-').join('.');
+                is_anonymous = true;
+            }
+
             output.ip = ip;
         },
         'rec': (r: string) => {
@@ -140,18 +146,12 @@ export async function normalizeRecord(record: Record<string, any>, _called_from?
             output.updated = r;
         },
         'acpt_mrf': (r: boolean) => {
-            // output.reference.allow_multiple_reference = r; // depricated
             output.source.prevent_multiple_referencing = !r;
         },
         'ref_limt': (r: number) => {
-            // output.reference.reference_limit = r; // depricated
             output.source.referencing_limit = r;
         },
-        "alw_gnt": (r: boolean) => {
-            output.source.allow_granted_to_grant_others = r; // depricated. // this is here just for backward compatibility. // now it will have value directly in prv_acs.allow_granted_to_grant_others
-        },
         'rfd': (r: number) => {
-            // output.reference.referenced_count = r; // depricated
             output.referenced_count = r;
         },
         'bin': async (r: string[]) => {
@@ -221,7 +221,7 @@ export async function normalizeRecord(record: Record<string, any>, _called_from?
             output.data = data;
         }
     };
-
+    
     if (record.record_id) {
         // bypass already normalized records
         return record as RecordData;
@@ -234,6 +234,10 @@ export async function normalizeRecord(record: Record<string, any>, _called_from?
                 await exec;
             }
         }
+    }
+
+    if(is_anonymous) {
+        output.user_id = 'anonymous:' + output.user_id;
     }
 
     return output as RecordData;
@@ -289,11 +293,12 @@ export async function deleteFiles(params: {
         storage: 'records'
     }, { auth: true, method: 'post' });
 
+    let to_process = [];
     for (let i in updatedRec) {
-        updatedRec[i] = normalizeRecord.bind(this)(updatedRec[i]);
+        to_process.push(normalizeRecord.bind(this)(updatedRec[i]));
     }
 
-    return await Promise.all(updatedRec);
+    return Promise.all(to_process);
 }
 
 export async function getFile(
@@ -527,18 +532,18 @@ async function prepGetParams(query, isDel = false) {
         let ref: any = query.reference;
         let ref_user = '';
 
-        // if (ref?.record_id || ref?.unique_id) {
-        if (ref?.record_id) {
+        if (ref?.record_id || ref?.unique_id) {
+        // if (ref?.record_id) {
+            // if (ref.unique_id && this.__my_unique_ids[ref.unique_id]) {
+            //     ref.record_id = this.__my_unique_ids[ref.unique_id];
+            //     delete ref.unique_id;
+            // }
+
             is_reference_fetch = ref.record_id || ref.unique_id;
 
             if (is_reference_fetch && typeof this.__private_access_key?.[is_reference_fetch] === 'string') {
                 query.private_key = this.__private_access_key?.[is_reference_fetch] || undefined;
             }
-
-            // if (this.__my_unique_ids[is_reference_fetch]) {
-            //     // ref.record_id = this.__my_unique_ids[is_reference_fetch];
-            //     // delete ref.unique_id;
-            // }
 
             query.reference = is_reference_fetch;
         }
@@ -578,12 +583,12 @@ export async function getRecords(query: GetRecordQuery & { private_key?: string;
         this.__private_access_key[is_reference_fetch] = result.reference_private_key;
     }
 
+    let to_process = [];
     for (let i in result.list) {
-        result.list[i] = normalizeRecord.bind(this)(result.list[i]);
-    };
+        to_process.push(normalizeRecord.bind(this)(result.list[i]));
+    }
 
-    result.list = await Promise.all(result.list);
-
+    result.list = await Promise.all(to_process);
     return result;
 }
 
@@ -600,9 +605,11 @@ export async function postRecord(
         throw new SkapiError('"config" argument is required.', { code: 'INVALID_PARAMETER' });
     }
 
-    if (!this.__user) {
-        throw new SkapiError('Login is required.', { code: 'INVALID_REQUEST' });
-    }
+    // if (!this.__user) {
+    //     throw new SkapiError('Login is required.', { code: 'INVALID_REQUEST' });
+    // }
+
+    let is_public = !this.__user;
 
     if (typeof config.table === 'string') {
         config.table = {
@@ -633,7 +640,6 @@ export async function postRecord(
 
         throw new SkapiError(`"reference_limit" should be type: <number | null>`, { code: 'INVALID_PARAMETER' });
     }
-
 
     if (config.table?.subscription) {
         if (config.table?.subscription?.is_subscription_record) {
@@ -744,9 +750,7 @@ export async function postRecord(
                         config.reference_private_key = this.__private_access_key[v] || undefined;
                     }
                     return validator.specialChars(v, '"reference.record_id"', false, false);
-                },
-                reference_limit: reference_limit_check, // depricated. this is here just for backward compatibility.
-                allow_multiple_reference: 'boolean', // depricated. this is here just for backward compatibility.
+                }
             });
         },
         index: {
@@ -797,7 +801,7 @@ export async function postRecord(
     // callbacks should be removed after checkparams
     delete _config.progress;
 
-    let options: { [key: string]: any } = { auth: true };
+    let options: { [key: string]: any } = { auth: !!this.__user, method: 'post' };
     let postData = null;
     let to_bin = null;
     let extractedForm = extractFormData(form);
@@ -807,6 +811,25 @@ export async function postRecord(
     }
     else if (extractedForm.files.length) {
         to_bin = extractedForm.files;
+    }
+
+
+    if (is_public) {
+        if(_config.record_id) {
+            throw new SkapiError('Public users cannot update existing records.', { code: 'INVALID_REQUEST' });
+        }
+        if(_config.table.access_group !== 'public' && _config.table.access_group !== 0){
+            throw new SkapiError('Public users can only post records to public tables.', { code: 'INVALID_REQUEST' });
+        }
+        if(_config.table.subscription) {
+            throw new SkapiError('Public users cannot post subscription records.', { code: 'INVALID_REQUEST' });
+        }
+        if(_config.remove_bin) {
+            throw new SkapiError('Public users cannot remove files from records.', { code: 'INVALID_REQUEST' });
+        }
+        if(_config.unique_id) {
+            throw new SkapiError('Public users cannot set unique_id for records.', { code: 'INVALID_REQUEST' });
+        }
     }
 
     postData = Object.assign({ data: extractedForm.data }, _config);
@@ -820,8 +843,9 @@ export async function postRecord(
     if (Object.keys(fetchOptions).length) {
         Object.assign(options, { fetchOptions });
     }
-
+    
     let rec = await request.bind(this)('post-record', postData, options);
+
     if (to_bin) {
         let bin_formData = new FormData();
         for (let f of to_bin) {
@@ -1038,19 +1062,19 @@ export async function getTags(
     );
 
     if (Array.isArray(res?.list)) {
-        for (let i in res.list) {
-            let item = res.list[i];
+        res.list = res.list.map(item => {
             let tSplit = item.tag.split('/');
-            res.list[i] = {
+            return {
                 table: tSplit[1],
                 tag: tSplit[0],
                 number_of_records: item.cnt_rec
             };
-        }
+        });
     }
 
     return res;
 }
+
 export async function getUniqueId(
     query?: Form<{
         /** Unique ID */
@@ -1087,6 +1111,7 @@ export async function getUniqueId(
 
     return res;
 }
+
 export async function deleteRecords(query: DelRecordQuery & { private_key?: string; }, fetchOptions?: FetchOptions): Promise<string | DatabaseResponse<RecordData>> {
     await this.__connection;
 
@@ -1104,30 +1129,6 @@ export function grantPrivateRecordAccess(params: {
     record_id: string;
     user_id: string | string[];
 }) {
-    params = validator.Params(params, {
-        record_id: 'string',
-        user_id: (v: string | string[]) => {
-            if (!v) {
-                throw new SkapiError(`User ID is required.`, { code: 'INVALID_PARAMETER' });
-            }
-
-            let id = v;
-            if (typeof id === 'string') {
-                id = [id];
-            }
-
-            if (id.length > 100) {
-                throw new SkapiError(`Cannot process more than 100 users at once.`, { code: 'INVALID_REQUEST' });
-            }
-
-            for (let i of id) {
-                validator.UserId(i, 'User ID in "user_id"');
-            }
-
-            return id;
-        }
-    }, ['record_id', 'user_id'], { ignoreEmpty: true });
-
     return recordAccess.bind(this)({
         record_id: params.record_id,
         user_id: params.user_id,
@@ -1139,14 +1140,6 @@ export function removePrivateRecordAccess(params: {
     record_id: string;
     user_id: string | string[];
 }) {
-    if (!params.record_id) {
-        throw new SkapiError(`Record ID is required.`, { code: 'INVALID_PARAMETER' });
-    }
-
-    if (!params.user_id || Array.isArray(params.user_id) && !params.user_id.length) {
-        throw new SkapiError(`User ID is required.`, { code: 'INVALID_PARAMETER' });
-    }
-
     return recordAccess.bind(this)({
         record_id: params.record_id,
         user_id: params.user_id || null,
@@ -1154,21 +1147,54 @@ export function removePrivateRecordAccess(params: {
     });
 }
 
-export async function listPrivateRecordAccess(params: {
-    record_id: string;
-    user_id: string | string[];
-}): Promise<DatabaseResponse<{ record_id: string; user_id: string; }>> {
-    let list = await recordAccess.bind(this)({
-        record_id: params.record_id,
-        user_id: params.user_id || null,
+export async function listPrivateRecordAccess(p: {
+    record_id?: string;
+    user_id?: string | string[];
+}, fetchOptions?: FetchOptions): Promise<DatabaseResponse<{ record_id: string; user_id: string; }>> {
+    let params = {
+        record_id: p.record_id || undefined,
+        user_id: p.user_id || undefined,
         execute: 'list'
-    });
+    };
 
-    list.list = list.list.map((i: Record<string, any>) => {
-        i.record_id = i.rec_usr.split('/')[0];
-        i.user_id = i.rec_usr.split('/')[1];
+    if (!params.record_id && !params.user_id) {
+        throw new SkapiError(`Either record_id or user_id must be provided.`, { code: 'INVALID_PARAMETER' });
+    }
+
+    if(params.user_id) {
+        if (typeof params.user_id === 'string') {
+            validator.UserId(params.user_id);
+            params.user_id = [params.user_id];
+        }
+        else if (Array.isArray(params.user_id)) {
+            for (let u of params.user_id) {
+                validator.UserId(u);
+            }
+        }
+        else {
+            throw new SkapiError(`user_id should be type: <string | string[]>`, { code: 'INVALID_PARAMETER' });
+        }
+    }
+
+    let mapper = (i: Record<string, any>) => {
+        if(i.rec_usr) {
+            i.record_id = i.rec_usr.split('/')[0];
+            i.user_id = i.rec_usr.split('/')[1];
+        }
+        else if(i.usr_rec) {
+            i.user_id = i.usr_rec.split('/')[0];
+            i.record_id = i.usr_rec.split('/')[1];
+        }
         return i;
-    });
+    };
+
+    let list = await request.bind(this)(
+        'grant-private-access',
+        params,
+        { auth: true, fetchOptions }
+    );
+
+    list.list = list.list.map(mapper);
 
     return list;
 }
@@ -1206,7 +1232,7 @@ export function requestPrivateRecordAccessKey(params: { record_id: string, refer
 function recordAccess(params: {
     record_id: string;
     user_id: string | string[];
-    execute: 'add' | 'remove' | 'list';
+    execute: 'add' | 'remove';
 }): Promise<any> {
     let execute = params.execute;
     let req = validator.Params(params,
@@ -1214,10 +1240,6 @@ function recordAccess(params: {
             record_id: 'string',
             user_id: (v: string | string[]) => {
                 if (!v) {
-                    if (execute == 'list') {
-                        return null;
-                    }
-
                     throw new SkapiError(`User ID is required.`, { code: 'INVALID_PARAMETER' });
                 }
 
@@ -1236,7 +1258,7 @@ function recordAccess(params: {
 
                 return id;
             },
-            execute: ['add', 'remove', 'list']
+            execute: ['add', 'remove']
         },
         [
             'execute',
